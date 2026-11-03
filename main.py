@@ -1340,7 +1340,7 @@ c_logo, c_title = st.columns([1, 4], vertical_alignment="center")
 if LOGO_BYTES:
     c_logo.image(LOGO_BYTES, width=230)
 c_title.markdown(f"""<div class="zhead"><h1>{APP['name']}</h1>
-<p>Visualiazção de Dados · {APP['institution']} · Professor: {APP['professor']}</p></div>""",
+<p>Visualização de Dados | {APP['institution']} | Professor: {APP['professor']}</p></div>""",
                  unsafe_allow_html=True)
 st.markdown('<div class="zbar"></div>', unsafe_allow_html=True)
 
