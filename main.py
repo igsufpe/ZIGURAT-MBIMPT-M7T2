@@ -1054,7 +1054,7 @@ def ask(provider, api_key, model, base_url, df, charts, filters, history, questi
 
 
 APP = {
-    "name": "DataViz.MBIMPT-M7T2",
+    "name": "MBIMPT-M7T2",
     "institution": "ZIGURAT Institute of Technology",
     "professor": "Ítalo Guedes",
 }
