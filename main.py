@@ -1,5 +1,5 @@
 """
-DataViz.MBIMPT-M7T2 — Painel de dados de modelos IFC com assistente de IA
+MBIMPT-M7T2 — Visualização de Dados BIM com assistente de IA
 ZIGURAT Institute of Technology · Professor: Ítalo Guedes
 
 Arquivo ÚNICO e autocontido (logo e modelo de exemplo embutidos).
