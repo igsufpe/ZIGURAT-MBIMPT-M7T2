@@ -582,45 +582,89 @@ def _layout(fig, spec, height=380):
     return fig
 
 
-def plotly_figure(df: pd.DataFrame, spec: dict, height=380):
+COLOR_MAPS: dict[str, dict] = {}   # {coluna: {valor: cor}} — cores fixas em todo o painel e no 3D
+
+
+def set_color_maps(df: pd.DataFrame, cols):
+    COLOR_MAPS.clear()
+    for c in cols:
+        if c in df.columns:
+            vals = sorted(df[c].dropna().astype(str).unique())
+            COLOR_MAPS[c] = {v: PALETTE[i % len(PALETTE)] for i, v in enumerate(vals)}
+
+
+def cmap(col):
+    return COLOR_MAPS.get(col) or None
+
+
+SELECTABLE = ("bar", "stacked_bar", "barh", "line", "scatter", "pie", "donut", "treemap")
+DONUT_ROOT = "Total"
+DIM = "#D5DAE6"
+
+
+def plotly_figure(df: pd.DataFrame, spec: dict, height=380, highlight: dict | None = None):
+    """highlight = {coluna: [valores]} -> destaca a seleção do próprio gráfico (filtragem cruzada)."""
     t, x, y, color = spec["type"], spec.get("x"), spec.get("y"), spec.get("color")
     data = aggregate(df, spec)
     vl = value_label(spec)
+    hl = {k: set(map(str, v)) for k, v in (highlight or {}).items()}
     if data.empty:
         fig = go.Figure()
         fig.add_annotation(text="Sem dados para os filtros atuais", showarrow=False)
         return _layout(fig, spec, height)
 
     c = color if color and color != x and t not in ("pie", "donut") else None
+    keys = [x] + ([c] if c else [])          # ordem do customdata
     if t in ("bar", "stacked_bar"):
-        fig = px.bar(data, x=x, y="valor", color=c, labels={"valor": vl},
-                     color_discrete_sequence=PALETTE, text_auto=True if not c else False)
+        fig = px.bar(data, x=x, y="valor", color=c, labels={"valor": vl}, custom_data=keys,
+                     color_discrete_sequence=PALETTE, color_discrete_map=cmap(c), text_auto=True if not c else False)
         if not c:
             fig.update_traces(marker_color=BRAND["blue"])
     elif t == "barh":
         d2 = data.iloc[::-1] if not c else data
-        fig = px.bar(d2, y=x, x="valor", color=c, orientation="h", labels={"valor": vl},
-                     color_discrete_sequence=PALETTE, text_auto=True if not c else False)
+        fig = px.bar(d2, y=x, x="valor", color=c, orientation="h", labels={"valor": vl}, custom_data=keys,
+                     color_discrete_sequence=PALETTE, color_discrete_map=cmap(c), text_auto=True if not c else False)
         if not c:
             fig.update_traces(marker_color=BRAND["blue"])
         fig.update_yaxes(categoryorder="array", categoryarray=list(data[x].cat.categories)[::-1])
     elif t in ("pie", "donut"):
+        # Sunburst de 1 nível = pizza/rosca CLICÁVEL (o Streamlit não captura cliques em go.Pie)
         d2 = data.groupby(x, observed=True)["valor"].sum().reset_index()
-        fig = px.pie(d2, names=x, values="valor", hole=0.55 if t == "donut" else 0,
-                     color_discrete_sequence=PALETTE)
-        fig.update_traces(textposition="inside", textinfo="percent+label")
+        d2 = d2[d2["valor"] > 0]
+        labels = [str(v) for v in d2[x]]
+        cm = cmap(x) or {}
+        cols = [cm.get(lab, PALETTE[i % len(PALETTE)]) for i, lab in enumerate(labels)]
+        if hl.get(x):
+            cols = [col if lab in hl[x] else DIM for lab, col in zip(labels, cols)]
+        vals = list(d2["valor"])
+        if t == "donut":
+            tot = float(sum(vals))
+            fig = go.Figure(go.Sunburst(
+                ids=[DONUT_ROOT] + labels, labels=[f"{DONUT_ROOT}<br>{tot:,.1f}".replace(",", ".")] + labels,
+                parents=[""] + [DONUT_ROOT] * len(labels), values=[tot] + vals, branchvalues="total",
+                marker=dict(colors=["#FFFFFF"] + cols, line=dict(color="white", width=2)),
+                textinfo="label+percent root", insidetextorientation="radial", maxdepth=2,
+                hovertemplate="%{id}<br>%{value:,.2f} (%{percentRoot:.1%})<extra></extra>"))
+        else:
+            fig = go.Figure(go.Sunburst(
+                ids=labels, labels=labels, parents=[""] * len(labels), values=vals,
+                marker=dict(colors=cols, line=dict(color="white", width=2)), textinfo="label+percent root",
+                insidetextorientation="radial",
+                hovertemplate="%{label}<br>%{value:,.2f} (%{percentRoot:.1%})<extra></extra>"))
     elif t == "treemap":
         path = [x] + ([color] if color and color != x else [])
         d2 = data[data["valor"] > 0]
-        fig = px.treemap(d2, path=path, values="valor", color_discrete_sequence=PALETTE)
+        fig = px.treemap(d2, path=path, values="valor", color=x, color_discrete_map=cmap(x),
+                         color_discrete_sequence=PALETTE)
     elif t == "line":
         fig = px.line(data, x=x, y="valor", color=c, markers=True, labels={"valor": vl},
-                      color_discrete_sequence=PALETTE)
+                      custom_data=keys, color_discrete_sequence=PALETTE, color_discrete_map=cmap(c))
     elif t == "histogram":
         fig = px.histogram(data, x=x, color=color, nbins=30, color_discrete_sequence=PALETTE)
     elif t == "scatter":
         fig = px.scatter(data, x=x, y=y, color=color, hover_data=["Nome", "Classe"],
-                         color_discrete_sequence=PALETTE)
+                         custom_data=["GlobalId"], color_discrete_sequence=PALETTE, color_discrete_map=cmap(color))
+        keys = ["GlobalId"]
     elif t == "box":
         fig = px.box(data, x=x, y=y, color=color, color_discrete_sequence=PALETTE)
     elif t == "table":
@@ -632,7 +676,136 @@ def plotly_figure(df: pd.DataFrame, spec: dict, height=380):
                                      number=dict(font=dict(color=BRAND["blue"]))))
     else:
         fig = go.Figure()
+
+    # Destaque da seleção (barras/linhas/pontos não selecionados ficam esmaecidos)
+    if hl and t in ("bar", "stacked_bar", "barh", "line", "scatter"):
+        idx = {k: i for i, k in enumerate(keys)}
+        for tr in fig.data:
+            cd = getattr(tr, "customdata", None)
+            if cd is None:
+                continue
+            ops = [1.0 if all(k not in idx or str(row[idx[k]]) in v for k, v in hl.items()) else 0.22
+                   for row in cd]
+            tr.marker.opacity = ops
     return _layout(fig, spec, height)
+
+
+def points_to_conds(spec: dict, points: list[dict]) -> dict:
+    """Converte os pontos clicados (evento do Streamlit) em condições de filtro {coluna: [valores]}."""
+    conds: dict[str, list] = {}
+    x = spec.get("x")
+    c = spec.get("color") if spec.get("color") and spec.get("color") != x else None
+    t = spec["type"]
+
+    def add(col, val):
+        if col and val is not None and str(val) not in conds.setdefault(col, []):
+            conds[col].append(str(val))
+
+    for p in points or []:
+        cd = p.get("customdata")
+        if isinstance(cd, (list, tuple)) and cd:
+            if t == "scatter":
+                add("GlobalId", cd[0])
+            else:
+                add(x, cd[0])
+                if c and len(cd) > 1:
+                    add(c, cd[1])
+        elif t in ("pie", "donut"):
+            lab = p.get("id") or p.get("label")
+            if lab and lab != DONUT_ROOT:
+                add(x, lab)
+        elif t == "treemap":
+            parts = [s for s in str(p.get("id") or p.get("label") or "").split("/") if s]
+            if parts:
+                add(x, parts[0])
+                if c and len(parts) > 1:
+                    add(c, parts[1])
+        else:
+            add(x, p.get("y") if t == "barh" else p.get("x"))
+    return {k: v for k, v in conds.items() if v}
+
+
+# ------------------------------------------------------------------ Visualizador 3D
+MAX_TRIS = 600_000
+
+
+def ifc_geometry(data: bytes, max_tris: int = MAX_TRIS):
+    """Triangula o modelo (coordenadas globais, metros). Retorna ({GlobalId: (verts, faces)}, truncado)."""
+    import multiprocessing
+    import ifcopenshell.geom
+    model = open_ifc_bytes(data)
+    s = ifcopenshell.geom.settings()
+    try:
+        s.set("use-world-coords", True)
+    except Exception:
+        s.set(s.USE_WORLD_COORDS, True)
+    it = ifcopenshell.geom.iterator(s, model, max(1, multiprocessing.cpu_count()))
+    geo, tot, truncated = {}, 0, False
+    if it.initialize():
+        while True:
+            sh = it.get()
+            g = sh.geometry
+            f = np.asarray(g.faces, dtype=np.int32).reshape(-1, 3)
+            if tot + len(f) > max_tris:
+                truncated = True
+            elif len(f):
+                geo[sh.guid] = (np.asarray(g.verts, dtype=np.float32).reshape(-1, 3), f)
+                tot += len(f)
+            if not it.next():
+                break
+    return geo, truncated
+
+
+def viewer_figure(geo_maps: dict, df_vis: pd.DataFrame, df_ctx: pd.DataFrame | None,
+                  color_by: str, height: int = 560):
+    """Malhas agrupadas por categoria (1 trace por valor) + contexto 'fantasma' opcional."""
+    def collect(sub, with_text):
+        V, F, T, off = [], [], [], 0
+        for mdl, gid, nome, tipo in sub[["Modelo", "GlobalId", "Nome", "Tipo"]].itertuples(index=False):
+            g = geo_maps.get(mdl, {}).get(gid)
+            if g is None:
+                continue
+            v, f = g
+            V.append(v); F.append(f + off); off += len(v)
+            if with_text:
+                T.append(np.full(len(v), f"{nome} · {tipo}", dtype=object))
+        if not V:
+            return None
+        return np.vstack(V), np.vstack(F), (np.concatenate(T) if T else None)
+
+    n_verts = sum(len(geo_maps.get(m, {}).get(g, (np.empty((0, 3)),))[0])
+                  for m, g in zip(df_vis["Modelo"], df_vis["GlobalId"]))
+    with_text = n_verts < 150_000
+    traces, shown = [], 0
+    for i, (val, sub) in enumerate(df_vis.groupby(color_by, sort=True)):
+        r = collect(sub, with_text)
+        if r is None:
+            continue
+        v, f, txt = r
+        shown += sub["GlobalId"].isin(set().union(*[set(geo_maps.get(m, {})) for m in sub["Modelo"].unique()])).sum()
+        traces.append(go.Mesh3d(
+            x=v[:, 0], y=v[:, 1], z=v[:, 2], i=f[:, 0], j=f[:, 1], k=f[:, 2],
+            color=(cmap(color_by) or {}).get(str(val), PALETTE[i % len(PALETTE)]), name=str(val)[:40], showlegend=True, flatshading=True,
+            lighting=dict(ambient=0.55, diffuse=0.75, specular=0.1, roughness=0.7, fresnel=0.1),
+            lightposition=dict(x=2000, y=1000, z=5000),
+            text=txt, hovertemplate=(f"<b>{str(val)[:40]}</b><br>%{{text}}<extra></extra>" if txt is not None
+                                     else f"<b>{str(val)[:40]}</b><extra></extra>")))
+    if df_ctx is not None and len(df_ctx):
+        r = collect(df_ctx, False)
+        if r is not None:
+            v, f, _ = r
+            traces.append(go.Mesh3d(x=v[:, 0], y=v[:, 1], z=v[:, 2], i=f[:, 0], j=f[:, 1], k=f[:, 2],
+                                    color="#9AA3B5", opacity=0.08, name="Contexto (fora do filtro)",
+                                    showlegend=True, hoverinfo="skip", flatshading=True))
+    fig = go.Figure(traces)
+    ax = dict(visible=False, showbackground=False)
+    fig.update_layout(height=height, margin=dict(l=0, r=0, t=0, b=0), uirevision="ifc3d",
+                      scene=dict(aspectmode="data", xaxis=ax, yaxis=ax, zaxis=ax, bgcolor="rgba(0,0,0,0)",
+                                 camera=dict(eye=dict(x=1.5, y=-1.5, z=1.0))),
+                      legend=dict(orientation="h", y=0.02, x=0.01, bgcolor="rgba(255,255,255,0.7)",
+                                  font=dict(size=11)),
+                      paper_bgcolor="rgba(0,0,0,0)")
+    return fig, int(shown), n_verts
 
 
 # ------------------------------------------------------------------ Matplotlib (PDF)
@@ -790,6 +963,7 @@ AÇÕES DISPONÍVEIS:
 5. {"action": "reset_template"}                    (restaura os gráficos T* originais)
 6. {"action": "set_filter", "column": COL, "values": [valores exatos]}  COL em """ + str(FILTER_COLUMNS) + """
 7. {"action": "reset_filters"}
+8. {"action": "clear_selection"}                   (limpa a seleção cruzada feita com cliques nos gráficos)
 
 SPEC de gráfico:
 {"title": str, "type": um de """ + str(CHART_TYPES) + """,
@@ -909,13 +1083,18 @@ def compute_kpis(df: pd.DataFrame) -> list[tuple[str, str]]:
 
 
 # ------------------------------------------------------------------ HTML
-def build_html(df, charts, kpis, meta: dict, logo_bytes: bytes | None) -> bytes:
+def build_html(df, charts, kpis, meta: dict, logo_bytes: bytes | None, fig3d=None) -> bytes:
     logo = f'<img src="data:image/png;base64,{base64.b64encode(logo_bytes).decode()}" alt="ZIGURAT">' if logo_bytes else ""
     cards = "".join(f'<div class="kpi"><span>{html.escape(k)}</span><b>{v}</b></div>' for k, v in kpis)
     figs = []
+    if fig3d is not None:
+        fig3d.update_layout(height=560)
+        figs.append('<div class="card wide"><h3 style="margin:6px 10px;color:#322F44">Modelo 3D</h3>'
+                    + fig3d.to_html(full_html=False, include_plotlyjs=True, config={"displaylogo": False})
+                    + "</div>")
     for i, spec in enumerate(charts):
         fig = plotly_figure(df, spec, height=420 if spec["type"] != "table" else 460)
-        figs.append(f'<div class="card">{fig.to_html(full_html=False, include_plotlyjs=(i == 0), config={"displaylogo": False})}</div>')
+        figs.append(f'<div class="card">{fig.to_html(full_html=False, include_plotlyjs=(i == 0 and fig3d is None), config={"displaylogo": False})}</div>')
     filt = html.escape(meta.get("filters") or "Nenhum")
     models = html.escape(", ".join(meta.get("models", [])))
     notes = f'<p class="notes">{html.escape(meta["notes"])}</p>' if meta.get("notes") else ""
@@ -935,6 +1114,7 @@ main{{max-width:1400px;margin:auto;padding:20px 16px}}
 .kpi span{{display:block;font-size:12px;color:#6b6a80}} .kpi b{{font-size:22px;color:var(--navy)}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:14px}}
 .card{{background:#fff;border-radius:10px;padding:8px;box-shadow:0 1px 3px #0001;overflow:hidden}}
+.wide{{grid-column:1/-1}}
 .notes{{background:#fff;border-radius:10px;padding:12px;border-left:4px solid var(--green)}}
 footer{{text-align:center;font-size:12px;color:#777;padding:20px}}
 @media(max-width:600px){{.grid{{grid-template-columns:1fr}}}}
@@ -1121,6 +1301,7 @@ def init_state():
     ss.setdefault("hidden", set())       # ids T* removidos
     ss.setdefault("chat", [])            # histórico
     ss.setdefault("counter", 0)
+    ss.setdefault("xsel", {})           # seleção cruzada: {id_grafico: {coluna: [valores]}}
     for c in FILTER_COLS:
         ss.setdefault(f"f_{c}", [])
     # Filtros pedidos pela IA/botões são aplicados no início do próximo ciclo
@@ -1142,6 +1323,11 @@ def load_model(digest: str, name: str, data: bytes, geom: bool):
     model = open_ifc_bytes(data)
     df, props = extract(model, name, geometric_quantities=geom)
     return df, props, model_info(model)
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def load_geometry(digest: str, _data: bytes):
+    return ifc_geometry(_data)
 
 
 def next_id():
@@ -1224,6 +1410,8 @@ PROPS = pd.concat(props_frames, ignore_index=True)
 
 if ss.template is None:
     ss.template = template_specs(DF)
+set_color_maps(DF, ["Classe", "Pavimento", "Material", "Tipo", "Modelo", "Externo", "Estrutural",
+                    "ResistenciaFogo", "Fonte_Quantidade"])
 
 # =================================================================== sidebar: filtros + IA
 with st.sidebar:
@@ -1258,11 +1446,53 @@ with st.sidebar:
 
 ACTIVE_FILTERS = {c: ss[f"f_{c}"] for c in FILTER_COLS if ss[f"f_{c}"]}
 DFF = base
-FILTER_TXT = "; ".join(f"{k}: {', '.join(v)}" for k, v in ACTIVE_FILTERS.items()) or "Nenhum"
 
 
 def all_charts():
     return [c for c in ss.template if c["id"] not in ss.hidden] + ss.user_charts
+
+
+# ------------------------------------------------------------------- seleção cruzada
+ss.xsel = {k: v for k, v in ss.xsel.items() if k in {c["id"] for c in all_charts()}}
+
+
+def xfilter(df: pd.DataFrame, exclude: str | None = None) -> pd.DataFrame:
+    """Aplica as seleções feitas por clique em outros gráficos."""
+    d = df
+    for cid, conds in ss.xsel.items():
+        if cid == exclude:
+            continue
+        for col, vals in conds.items():
+            if col in d.columns:
+                d = d[d[col].astype(str).isin(vals)]
+    return d
+
+
+def on_chart_select(cid: str):
+    state = ss.get(f"pl_{cid}") or {}
+    try:
+        points = state["selection"]["points"]
+    except (KeyError, TypeError):
+        points = []
+    spec = next((c for c in all_charts() if c["id"] == cid), None)
+    conds = points_to_conds(spec, points) if spec else {}
+    if conds:
+        ss.xsel[cid] = conds
+    else:
+        ss.xsel.pop(cid, None)
+
+
+def _short(vals, n=4):
+    vals = list(vals)
+    return ", ".join(vals[:n]) + (f" +{len(vals) - n}" if len(vals) > n else "")
+
+
+XSEL_TXT = " · ".join(
+    f"{cid}: " + " & ".join(f"{col} = {_short(v)}" for col, v in conds.items()) for cid, conds in ss.xsel.items())
+DFX = xfilter(DFF)  # dados filtrados (barra lateral) + seleção cruzada
+FILTER_TXT = "; ".join(f"{k}: {', '.join(v)}" for k, v in ACTIVE_FILTERS.items()) or "Nenhum"
+if XSEL_TXT:
+    FILTER_TXT += f" | Seleção por clique — {XSEL_TXT}"
 
 
 # =================================================================== ações (LLM / UI)
@@ -1313,6 +1543,9 @@ def apply_actions(actions: list[dict]) -> list[str]:
                     chosen = [str(v) for v in (vals if isinstance(vals, list) else [vals]) if str(v) in valid]
                     queue_filter(col, chosen)
                     log.append(f"🔎 Filtro {col}: {', '.join(chosen) or 'todos'}")
+            elif kind == "clear_selection":
+                ss.xsel = {}
+                log.append("🎯 Seleção cruzada limpa")
             elif kind == "reset_filters":
                 for col in FILTER_COLS:
                     queue_filter(col, [])
@@ -1332,11 +1565,57 @@ with tab_dash:
 
     with col_dash:
         st.caption(f"**Modelos:** {', '.join(ss.models)} · **Filtros:** {FILTER_TXT}")
-        kpis = compute_kpis(DFF)
+        kpis = compute_kpis(DFX)
         kc = st.columns(len(kpis))
         for c, (k, v) in zip(kc, kpis):
             c.markdown(f'<div class="kpi"><span>{k}</span><b>{v}</b></div>', unsafe_allow_html=True)
         st.write("")
+
+        # ---------------- seleção cruzada
+        if ss.xsel:
+            s1, s2 = st.columns([5, 1], vertical_alignment="center")
+            s1.info(f"🎯 **Seleção ativa** ({len(DFX)} elementos) — {XSEL_TXT}")
+            if s2.button("✕ Limpar seleção", width="stretch"):
+                ss.xsel = {}
+                st.rerun()
+        else:
+            st.caption("👆 **Clique** em uma barra, fatia ou bloco para filtrar todo o painel e o modelo 3D "
+                       "(Shift+clique seleciona vários; clique duplo no gráfico desfaz).")
+
+        # ---------------- visualizador 3D
+        with st.container(border=True):
+            v1, v2, v3, v4 = st.columns([2.4, 1, 1.4, 1.2], vertical_alignment="center")
+            v1.markdown("**🧊 Visualizador 3D do modelo IFC**")
+            show3d = v2.toggle("Exibir", value=True, key="v_on")
+            color_by = v3.selectbox("Colorir por", ["Classe", "Pavimento", "Material", "Tipo", "Modelo",
+                                                    "Externo", "Estrutural"], key="v_color",
+                                    label_visibility="collapsed")
+            ghost = v4.toggle("Contexto", value=True, key="v_ghost",
+                              help="Mostra em cinza transparente os elementos fora do filtro/seleção")
+            if show3d:
+                geo_maps, trunc = {}, False
+                with st.spinner("Processando geometria 3D (só na primeira vez)…"):
+                    for name, data in ss.models.items():
+                        try:
+                            g, t_ = load_geometry(hashlib.md5(data).hexdigest(), data)
+                            geo_maps[name] = g
+                            trunc = trunc or t_
+                        except Exception as e:
+                            st.warning(f"Geometria de {name} indisponível: {e}")
+                ctx = None
+                if ghost and len(DFX) < len(DF):
+                    ctx = DF[~DF.set_index(["Modelo", "GlobalId"]).index.isin(
+                        DFX.set_index(["Modelo", "GlobalId"]).index)]
+                fig3d, n_show, n_verts = viewer_figure(geo_maps, DFX, ctx, color_by)
+                ss.last_fig3d = fig3d if n_verts < 400_000 else None
+                st.plotly_chart(fig3d, width="stretch", key="viewer3d",
+                                config={"displaylogo": False, "scrollZoom": True})
+                n_geo = sum(len(g) for g in geo_maps.values())
+                st.caption(f"{n_show} de {len(DFX)} elementos filtrados exibidos · {n_geo} elementos com geometria no(s) "
+                           f"modelo(s). Arraste para girar, role para zoom, botão direito para mover."
+                           + (" ⚠️ Modelo grande: geometria limitada a 600 mil triângulos." if trunc else ""))
+            else:
+                ss.last_fig3d = None
 
         charts_now = all_charts()
         for row in range(0, len(charts_now), 2):
@@ -1348,11 +1627,18 @@ with tab_dash:
                     if h2.button("🗑", key=f"del_{spec['id']}", help="Remover do painel"):
                         apply_actions([{"action": "remove_chart", "id": spec["id"]}])
                         st.rerun()
+                    dsrc = xfilter(DFF, exclude=spec["id"])  # não filtra o gráfico pela própria seleção
                     if spec["type"] == "table":
                         st.markdown(f"**{spec['title']}**")
-                        st.dataframe(aggregate(DFF, spec), hide_index=True, width="stretch", height=330)
+                        st.dataframe(aggregate(dsrc, spec), hide_index=True, width="stretch", height=330)
+                    elif spec["type"] in SELECTABLE:
+                        st.plotly_chart(plotly_figure(dsrc, spec, highlight=ss.xsel.get(spec["id"])),
+                                        width="stretch", config={"displaylogo": False}, key=f"pl_{spec['id']}",
+                                        on_select=lambda cid=spec["id"]: on_chart_select(cid),
+                                        selection_mode=("points", "box", "lasso") if spec["type"] == "scatter"
+                                        else ("points",))
                     else:
-                        st.plotly_chart(plotly_figure(DFF, spec), width="stretch",
+                        st.plotly_chart(plotly_figure(dsrc, spec), width="stretch",
                                         config={"displaylogo": False}, key=f"pl_{spec['id']}")
 
         with st.expander("➕ Criar gráfico manualmente (sem IA)"):
@@ -1400,8 +1686,9 @@ with tab_dash:
                 ss.chat.append({"role": "user", "content": q})
                 try:
                     with st.spinner("Pensando…"):
-                        out = ask(provider, api_key, model_name, base_url, DFF, all_charts(),
-                                      ACTIVE_FILTERS, ss.chat[:-1], q)
+                        out = ask(provider, api_key, model_name, base_url, DFX, all_charts(),
+                                      {**ACTIVE_FILTERS, **({"seleção por clique": XSEL_TXT} if XSEL_TXT else {})},
+                                      ss.chat[:-1], q)
                     log = apply_actions(out["actions"])
                     text = out["reply"] or "Pronto."
                     if log:
@@ -1418,13 +1705,13 @@ with tab_dash:
 with tab_data:
     st.subheader("Modelos carregados")
     st.dataframe(pd.DataFrame(infos).T, width="stretch")
-    st.subheader(f"Elementos filtrados ({len(DFF)})")
-    st.dataframe(DFF, width="stretch", height=380, hide_index=True)
-    st.download_button("⬇️ Baixar CSV dos elementos", DFF.to_csv(index=False, sep=";").encode("utf-8-sig"),
+    st.subheader(f"Elementos filtrados ({len(DFX)})")
+    st.dataframe(DFX, width="stretch", height=380, hide_index=True)
+    st.download_button("⬇️ Baixar CSV dos elementos", DFX.to_csv(index=False, sep=";").encode("utf-8-sig"),
                        "elementos_ifc.csv", "text/csv")
 
     st.subheader("Explorador de propriedades (Psets / Qtos)")
-    pf = PROPS[PROPS["GlobalId"].isin(DFF["GlobalId"])]
+    pf = PROPS[PROPS["GlobalId"].isin(DFX["GlobalId"])]
     if pf.empty:
         st.info("Nenhuma propriedade para os elementos filtrados.")
     else:
@@ -1445,8 +1732,8 @@ with tab_data:
         st.subheader("Completude de dados por classe (% elementos com o Pset)")
         top_psets = pf["Pset"].value_counts().head(12).index
         m = pf[pf["Pset"].isin(top_psets)][["GlobalId", "Pset"]].drop_duplicates() \
-            .merge(DFF[["GlobalId", "Classe"]], on="GlobalId")
-        tot = DFF.groupby("Classe").size()
+            .merge(DFX[["GlobalId", "Classe"]], on="GlobalId")
+        tot = DFX.groupby("Classe").size()
         heat = (m.groupby(["Classe", "Pset"]).size().unstack(fill_value=0).div(tot, axis=0) * 100).round(0)
         st.dataframe(heat.style.background_gradient(cmap="Blues", vmin=0, vmax=100).format("{:.0f}%"),
                      width="stretch")
@@ -1465,9 +1752,9 @@ with tab_rep:
                 "filters": FILTER_TXT, "date": now_str()}
         with st.spinner("Gerando HTML e PDF…"):
             charts_now = all_charts()
-            kp = compute_kpis(DFF)
-            html_bytes = build_html(DFF, charts_now, kp, meta, LOGO_BYTES)
-            pdf_bytes = build_pdf(DFF, charts_now, kp, meta, LOGO_BYTES, html_bytes if attach else None)
+            kp = compute_kpis(DFX)
+            html_bytes = build_html(DFX, charts_now, kp, meta, LOGO_BYTES, fig3d=ss.get("last_fig3d"))
+            pdf_bytes = build_pdf(DFX, charts_now, kp, meta, LOGO_BYTES, html_bytes if attach else None)
         ss.report = (pdf_bytes, html_bytes)
         st.success("Relatório gerado!")
     if ss.get("report"):
@@ -1493,7 +1780,10 @@ with tab_help:
 3. **Template** — gráficos `T1…T6` são o padrão visual; os criados no chat/manual recebem `C1, C2…`.
 4. **Assistente IA** — escolha o provedor, cole a chave API e converse. A IA devolve apenas *especificações JSON*
    (nunca código), que o app valida antes de aplicar.
-5. **Relatório** — gera PDF (KPIs, gráficos, quantitativos) com o dashboard interativo `.html` anexado.
+5. **Filtragem cruzada** — clique numa barra, fatia ou bloco de qualquer gráfico: KPIs, demais gráficos, modelo 3D,
+   tabela de dados e relatório passam a mostrar só aquela seleção. Shift+clique soma itens; *Limpar seleção* desfaz.
+6. **Visualizador 3D** — geometria triangulada do IFC, colorida por Classe, Pavimento, Material…; segue filtros e seleções.
+7. **Relatório** — gera PDF (KPIs, gráficos, quantitativos) com o dashboard interativo `.html` anexado.
 
 ### Colunas extraídas
 `{', '.join(DF.columns)}`
