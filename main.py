@@ -38,7 +38,7 @@ for _mod, _pkg in _REQ.items():
     except ModuleNotFoundError:
         _missing.append(_pkg)
 if _missing:
-    st.set_page_config(page_title="DataViz.MBIMPT-M7T2", layout="centered")
+    st.set_page_config(page_title="MBIMPT-M7T2", layout="centered")
     st.error("Bibliotecas não instaladas: **" + ", ".join(_missing) + "**")
     st.markdown("""
 O servidor não encontrou o arquivo **requirements.txt**. Para corrigir:
